@@ -1,0 +1,210 @@
+#!/bin/sh
+
+set -e
+
+softquit() {
+    rm -f "$LOCK_FILE"
+    exit 0
+}
+
+error() {
+    echo "ERROR: $1" >&2
+    exit 1
+}
+
+### HELP ######################################################################
+
+if [ -z "$1" ] || [ "$1" = "-h" ] || [ "$1" = "--help" ]; then
+    echo "Install .deb packages on systems that don't have apt."
+    echo "Will install/extract packages to ~/.local/share/wapt/installed ."
+    echo "Ansible roles and collections are symlinked to ~/.ansible ."
+    echo "Actions are 'update', 'install' or 'list'."
+    echo "Works without root."
+    echo "Only dependencies are wget, ar, tar and md5sum."
+    echo "Currently not possible to install a specific version of a package."
+    echo ""
+    echo "Usage:"
+    echo "  wapt <ACTION> <PACKAGE_NAME> <REPO_URL>"
+    echo "or:"
+    echo "  export WAPT_REPO_URL=<REPO_URL>"
+    echo "  wapt <ACTION> <PACKAGE_NAME>"
+    echo "Example:"
+    echo "  wapt install hello-world http://example.com/repo"
+    echo "  wapt list http://example.com/repo"
+    exit 0
+fi
+
+### VARIABLES #################################################################
+
+readonly DIR_BASE="$HOME/.local/share/wapt"
+readonly LOCK_FILE="/tmp/.waptlock"
+
+readonly ACTION="$1"
+case $ACTION in
+install)
+    readonly PACKAGE_NAME="$2"
+    [ -n "$PACKAGE_NAME" ] || error "Package name not provided"
+    # get the repository URL from arg or env
+    [ -n "$3" ] && readonly WAPT_REPO_URL="$3"
+    ;;
+list | update)
+    # get the repository URL from arg or env
+    [ -n "$2" ] && readonly WAPT_REPO_URL="$2"
+    ;;
+esac
+[ -n "$WAPT_REPO_URL" ] ||
+    error "Repository variable WAPT_REPO_URL not provided"
+
+readonly FILE_INDEX="$DIR_BASE/packages.txt"
+readonly DIR_INSTALLED="$DIR_BASE/installed"
+readonly DIR_REPO_CACHE="$DIR_BASE/cache"
+readonly URL_INDEX="$WAPT_REPO_URL/Packages"
+readonly ANSIBLE_BASE="$HOME/.ansible"
+readonly ANSIBLE_ROLE_SRC="usr/share/ansible/roles"
+readonly ANSIBLE_COLL_SRC="usr/share/ansible/collections"
+readonly ANSIBLE_ROLE_DST="$ANSIBLE_BASE/roles"
+readonly ANSIBLE_COLL_DST="$ANSIBLE_BASE/collections/ansible_collections"
+
+# verify that the repository URL starts with http
+echo "$WAPT_REPO_URL" | grep -q "^http" ||
+    error "Invalid repository URL: $WAPT_REPO_URL, must start with 'http...'"
+
+### MAIN ######################################################################
+
+# only allow one process at a time
+# loop and wait 1 second if another instance is running
+# abort after a maximum of 3 minutes
+COUNT=0
+while [ -f "$LOCK_FILE" ]; do
+    [ $COUNT -eq 1 ] && echo "Another instance is running, waiting..."
+    COUNT=$((COUNT + 1))
+    [ $COUNT -le 180 ] || error "Another instance is running timeout"
+    sleep 1
+done
+
+# create lock file
+touch "$LOCK_FILE"
+
+# abort if wget is not installed
+command -v wget >/dev/null || error "wget is not installed"
+command -v ar >/dev/null || error "ar is not installed"
+command -v tar >/dev/null || error "tar is not installed"
+command -v md5sum >/dev/null || error "md5sum is not installed"
+
+# create base directories
+mkdir -p "$DIR_INSTALLED" "$DIR_REPO_CACHE" || error "Create base directories"
+
+# list all packages and exit
+case $ACTION in
+update)
+    # update the package index
+    wget -q "$URL_INDEX" -O "$FILE_INDEX" ||
+        error "Failed to update package index from $URL_INDEX"
+    softquit
+    ;;
+esac
+
+# check if the package index exists
+[ -f "$FILE_INDEX" ] || error "Package index not found, run 'wapt update'"
+# verify file structure
+head -n1 "$FILE_INDEX" | grep -q "^Package:" || error "Invalid package index"
+
+# list all packages and exit
+case $ACTION in
+list)
+    # list all packages and exit
+    awk '$1 == "Package:" { print $2 }' "$FILE_INDEX" | sort -u
+    softquit
+    ;;
+esac
+
+# install a package
+
+# get package data, for all packages with the same name
+PKG_DATA=$(awk -v PKG="$PACKAGE_NAME" '
+    $1 == "Package:" && $2 == PKG {
+        print $0
+        FOUND=1
+        next
+    }
+    FOUND {
+        if ($1 == "Package:" && $2 != PKG) {
+            exit
+        } else {
+            print $0
+        }
+    }
+' "$FILE_INDEX")
+
+# get version
+PKG_VERSION=$(echo "$PKG_DATA" | awk '$1 == "Version:" { print $2 }' |
+    head -n1)
+[ -n "$PKG_VERSION" ] || error "Package version not found: $PACKAGE_NAME"
+
+# get download url
+PKG_DL_SUFFIX=$(echo "$PKG_DATA" | awk '$1 == "Filename:" { print $2 }' |
+    head -n1)
+PKG_DL_SUFFIX_CLEAN=$(basename "$PKG_DL_SUFFIX")
+[ -n "$PKG_DL_SUFFIX_CLEAN" ] || error "Failed to get package download URL"
+PKG_DL_URL="$WAPT_REPO_URL/$PKG_DL_SUFFIX_CLEAN"
+
+# get md5sum
+PKG_MD5=$(echo "$PKG_DATA" | awk '$1 == "MD5sum:" { print $2 }' |
+    head -n1)
+[ -n "$PKG_MD5" ] || error "Failed to get package MD5sum"
+
+# install the package
+INSTALL_DIR="$DIR_INSTALLED/$PACKAGE_NAME""_""$PKG_VERSION"
+# exit if the package is already installed
+if [ -d "$INSTALL_DIR" ]; then
+    echo "Package already installed to $INSTALL_DIR"
+else
+    # download the .deb file
+    FILE_DEB="$DIR_REPO_CACHE/$PKG_DL_SUFFIX_CLEAN"
+    echo "Downloading package to $FILE_DEB"
+    wget -q "$PKG_DL_URL" -O "$FILE_DEB" || error "Failed to download package"
+
+    # verify the MD5 sum
+    echo "$PKG_MD5 $FILE_DEB" | md5sum -c --status || error "MD5 sum mismatch"
+
+    # extract the .deb file
+    echo "Installing package to $INSTALL_DIR"
+    mkdir "$INSTALL_DIR" || error "Failed to create installation directory"
+    OLD_DIR=$(pwd)
+    cd "$INSTALL_DIR" || error "Failed to change directory"
+    ar x "$FILE_DEB" || error "Failed to extract package"
+    tar -xf data.tar.* || error "Failed to extract data"
+    tar -xf control.tar.* || error "Failed to extract control"
+    rm -f debian-binary data.tar.* control.tar.* _gpgmaint ||
+        error "Failed to clean up"
+    cd "$OLD_DIR" || error "Failed to change directory"
+
+    # custom installer
+    case "$PACKAGE_NAME" in
+    ansible-role-*)
+        echo "Linking Ansible role"
+        ROLE_SRC="$INSTALL_DIR/$ANSIBLE_ROLE_SRC"
+        [ -d "$ROLE_SRC" ] || error "Role directory not found: $ROLE_SRC"
+        # symlink roles to the Ansible directory
+        mkdir -p "$ANSIBLE_ROLE_DST" || error "mkdir $ANSIBLE_ROLE_DST"
+        ln -vsf "$ROLE_SRC"/* "$ANSIBLE_ROLE_DST" || error "symlink roles"
+        ;;
+    ansible-coll-*)
+        echo "Linking Ansible collection"
+        COLL_SRC="$INSTALL_DIR/$ANSIBLE_COLL_SRC"
+        [ -d "$COLL_SRC" ] || error "Collection directory not found: $COLL_SRC"
+        mkdir -p "$ANSIBLE_COLL_DST" || error "mkdir $ANSIBLE_COLL_DST"
+        # for each subfolder in COLL_SRC
+        # create the same folder in the Ansible collection directory
+        # then symlink the contents
+        for SUBDIR in "$COLL_SRC"/*; do
+            [ -d "$SUBDIR" ] || continue
+            COLL_DST="$ANSIBLE_COLL_DST/$(basename "$SUBDIR")"
+            mkdir -p "$COLL_DST" || error "mkdir $COLL_DST"
+            ln -vsf "$SUBDIR"/* "$COLL_DST" || error "symlink collection"
+        done
+        ;;
+    esac
+fi
+
+softquit
